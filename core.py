@@ -80,12 +80,12 @@ class ReadOnlyWorktree(object):
 
 ######       App           #######
 
-class App():
+class App:
     verbose  = True
     debug    = False
     dryRun   = False
     noChecks = False
-    number = 0
+    number   = None
 
     def __init__(self):
         self._free = []
@@ -147,7 +147,8 @@ class App():
     @staticmethod
     def run(body):
         def _run():
-            with App() as app:
+            app = App()
+            with app:
                 body(app)
         return GitTfException.run(_run)
 
