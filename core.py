@@ -1,89 +1,158 @@
 import subprocess as proc
-import os, stat, re, datetime, argparse
+import os
+import stat
+import datetime
+import argparse
+import time
+import locale
+import sys
+from itertools import *
 import xml.etree.ElementTree as etree
 
 os.environ['GIT_NOTES_REF'] = 'refs/notes/tf'
+locale.setlocale(locale.LC_ALL, '')
+
+
+class GitTfException(Exception):
+    pass
+
+
+def fail(msg=None):
+    if msg:
+        print(msg)
+    raise GitTfException(None)
 
 _curCommand = None
 
-def runner(executable = ''):
-    def run(args, allowedExitCodes = [0], errorMsg = None, errorValue = None, output = False, indent = 1, dryRun = None):
+
+class Runner:
+    def __init__(self, prefix=''):
+        self.prefix = prefix
+
+    def start(self, args):
+        class Process:
+            def __init__(self, pipe):
+                self.pipe = pipe
+
+            def readline(self):
+                while True:
+                    line = self.pipe.stdout.readline()
+                    if line != b'':
+                        return line.decode('utf-8')[:-1]
+                    elif self.pipe.poll() is not None:
+                        return None
+                    else:
+                        time.sleep(0.05)
+
+            def poll(self):
+                return self.pipe.poll()
+
+            @property
+            def exitCode(self):
+                return self.pipe.returncode
+
+            def fail(self, lastMsg=None):
+                errorOutput = self.pipe.stderr.readall().decode('utf-8').strip()
+                if errorOutput:
+                    print(errorOutput)
+                print('Command "%s" exited with code %s' % (cmd, self.poll()))
+                if lastMsg:
+                    print(lastMsg)
+                fail()
+
+        cmd = (self.prefix and self.prefix + ' ') + args
+        return Process(proc.Popen(cmd, shell=True, stderr=proc.PIPE, stdout=proc.PIPE))
+
+    def __call__(self, args, allowedExitCodes=[0], errorValue=None, output=False, indent=1, dryRun=None, errorMsg=None):
         verbose = _curCommand and _curCommand.args.verbose > 1
-        cmd = args
-        if executable:
-            cmd = '%s %s' % (executable, cmd)
 
         if verbose:
-            print('$ ' + cmd)
+            print('$ ' + (self.prefix and self.prefix + ' ') + args)
         if dryRun:
             return dryRun
 
+        process = self.start(args)
+
         result = ''
-        p = proc.Popen(cmd, shell = True, stderr = proc.PIPE, stdout = proc.PIPE)
+        for line in iter(process.readline, None):
+            if output or verbose:
+                print('  ' * indent + line)
+            result = result and result + '\n'
+            result += line
 
-        while True:
-            line = p.stdout.readline()
-            if line != b'':
-                line = line.decode('utf-8')
-                if output or verbose:
-                    print('  ' * indent + line, end = '')
-                result += line
-            elif not p.poll() is None:
-                break
+        if process.exitCode in allowedExitCodes:
+            return result
+        elif errorValue is not None:
+            return errorValue
+        else:
+            process.fail(errorMsg)
 
-        if len(result) > 0 and result[-1] == '\n':
-            result = result[:-1]
-
-        if p.returncode not in allowedExitCodes:
-            if errorValue != None:
-                return errorValue
-            if errorMsg:
-                print(errorMsg)
-            print(p.stderr.readall().decode('utf-8'))
-            fail('Command "%s" exited with code %s' % (cmd, p.returncode))
-        return result
-    return run
+run = Runner()
 
 #######      GIT       #######
 
-git = runner('git')
-git('--version', errorMsg = 'Git not found in $PATH variable')
+git = Runner('git')
+try:
+    git('--version', errorMsg='Git not found in the $PATH variable')
+except GitTfException:
+    exit(1)
 
 #######      TFS       #######
 
-tf = runner(git('config tf.cmd', errorValue = 'tf'))
 
-class Changeset(object):
-    def __init__(self, node):
-        self.id = node.get('id')
-        self.comment = node.find('comment')
-        self.comment = self.comment is not None and self.comment.text or ''
-        self.dateIso = node.get('date')
-        self.date = parseXmlDatetime(self.dateIso)
-        self.committer = node.get('committer').split('\\', 1)[-1].strip()
-        self.line = ('%s %s %s %s' % (self.id, self.committer, self.date.ctime(), self.comment)).strip()
+class _tf(Runner):
+    def __init__(self):
+        Runner.__init__(self, git('config tf.cmd', errorValue='tf'))
 
-def _history(args):
-    args = 'history -recursive -format:xml %s .' % args
-    history = etree.fromstring(tf(args))
-    return [Changeset(cs) for cs in history if cs.tag == 'changeset']
+    class Changeset(object):
+        def __init__(self, node):
+            self.id = node.get('id')
+            self.comment = node.find('comment')
+            self.comment = self.comment is not None and self.comment.text or ''
+            self.dateIso = node.get('date')
+            self.date = parseXmlDatetime(self.dateIso)
+            self.committer = node.get('committer').split('\\', 1)[-1].strip()
+            self.line = ('%s %s %s %s' % (self.id, self.committer, self.date.ctime(), self.comment)).strip()
 
-tf.history = _history
+    def history(self, args):
+        args = 'history -recursive -format:xml %s .' % args
+        history = etree.fromstring(self(args))
+        return [self.Changeset(cs) for cs in history if cs.tag == 'changeset']
+
+    def getDomain(self):
+        domain = git('config tf.domain', errorValue='')
+        if domain:
+            return domain
+
+        email = git('config user.email')
+        if not email:
+            print('Email not set. Configure it:')
+            fail('$ git config user.email userName@yourTfsServer.com')
+        try:
+            return email[email.index('@') + 1:]
+        except ValueError:
+            fail('Could not determine the domain. Your email is: ')
+
+tf = _tf()
+
 
 class ReadOnlyWorktree(object):
-    def __init__(self, output = False):
+    def __init__(self, output=False):
         self.output = output
+
     def __enter__(self):
         if self.output:
             print('Making files read-only')
         chmod('.', False)
         chmod('.git', True)
+
     def __exit__(self, _, __, ___):
         if self.output:
             print('Making files writable')
         chmod('.', True)
 
 ######       App           #######
+
 
 class Command:
     def __init__(self):
@@ -96,21 +165,17 @@ class Command:
             prog='git-tf-' + type(self).__name__)
 
     def initArgParser(self, parser):
-        parser.add_argument('-v', '--verbose', action='count', help='be verbous', default=0)
-        parser.set_defaults(cmd=self, dryRun=False)
+        parser.set_defaults(cmd=self, dryRun=False, verbose=0)
         self._initArgParser(parser)
-    def _initArgParser(self, parser):
-        parser.add_argument('-C', '--noChecks', action='store_true', help='skip long checks, such as TFS status')
-        parser.add_argument('--dryRun', action='store_true', help='do not make any changes')
 
-    def readConfigValue(self, name):
-        return git('config tf.%s' % name, errorMsg = 'git tf is not configured. Config value "%s" not found.' % name)
+    def _initArgParser(self, parser):
+        pass
 
     def moveToRootDir(self):
         root = git('rev-parse --show-toplevel')
         origDir = os.path.abspath('.')
         os.chdir(root)
-        self._free.append(lambda : os.chdir(origDir))
+        self._free.append(lambda: os.chdir(origDir))
 
     def checkStatus(self, checkTfs=None):
         if git('status -s') != '':
@@ -123,8 +188,11 @@ class Command:
 
     def switchToTfsBranch(self):
         def getCurBranch():
-            return [b[2:] for b in git('branch').splitlines() if b.startswith('* ')][0]
+            branches = git('branch').splitlines()
+            return [b[2:] for b in branches if b.startswith('* ')][0]
+
         noBranch = '(no branch)'
+
         def checkoutBranch(branch):
             curBranch = getCurBranch()
             if curBranch != branch and curBranch != noBranch:
@@ -136,9 +204,7 @@ class Command:
         self._free.append(lambda: checkoutBranch(origBranch))
 
     def __enter__(self):
-        self.moveToRootDir()
-        self.checkStatus()
-        self.switchToTfsBranch()
+        pass
 
     def __exit__(self, *rest):
         for a in self._free:
@@ -150,7 +216,7 @@ class Command:
     def runWithArgs(self, args):
         if args.verbose:
             print('Parsed arguments:')
-            indentPrint(str(args))
+            printIndented(str(args))
             print()
 
         if args.dryRun:
@@ -174,26 +240,37 @@ class Command:
         self.initArgParser(parser)
         self.runWithArgs(parser.parse_args())
 
-
-class GitTfException(Exception):
-    pass
-
-def fail(msg = None):
-    if msg: print(msg)
-    raise GitTfException(None)
-
 #######      util       #######
 
-def parseXmlDatetime(str):
-    return datetime.datetime.strptime(str, '%Y-%m-%dT%H:%M:%S.%f%z')
 
-def chmod(path, writable, rec = True):
+class ArgParser(argparse.ArgumentParser):
+    def addVerbose(self):
+        self.add_argument('-v', '--verbose', action='count', default=0,
+            help='be verbous')
+
+    def addNoChecks(self):
+        self.add_argument('-C', '--noChecks', action='store_true',
+            help='skip long checks, such as TFS status')
+
+    def addDryRun(self):
+        self.add_argument('--dryRun', action='store_true',
+            help='do not make any changes')
+
+    def addNumber(self, help):
+        self.add_argument('--number', type=int, default=None, help=help)
+
+
+def parseXmlDatetime(text):
+    return datetime.datetime.strptime(text, '%Y-%m-%dT%H:%M:%S.%f%z')
+
+
+def chmod(path, writable, rec=True):
     def update(path):
         mode = os.stat(path).st_mode
         if writable:
-            mode = mode | stat.S_IWRITE
+            mode |= stat.S_IWRITE
         else:
-            mode = mode & ~stat.S_IWRITE
+            mode &= ~stat.S_IWRITE
         os.chmod(path, mode)
     if not rec:
         update(path)
@@ -202,7 +279,8 @@ def chmod(path, writable, rec = True):
             for filename in filenames:
                 update(os.path.join(root, filename))
 
-def indentPrint(text, indent = 1):
+
+def printIndented(text, indent=1):
     if isinstance(text, str):
         lines = text.splitlines()
     else:
@@ -211,9 +289,34 @@ def indentPrint(text, indent = 1):
     for line in lines:
         print('  ' * indent + line)
 
-def toCamelCase(str):
-    return re.sub(r'\-\w', lambda m: m.group()[1].capitalize(), str)
 
-_terminalHeight, _terminalWidth = [int(x) for x in os.popen('stty size', 'r').read().split()] or [24,80]
+_terminalHeight, terminalWidth = [int(x) for x in os.popen('stty size', 'r').read().split()] or [24, 80]
+
+
 def printLine():
-    print('_' * _terminalWidth)
+    print('_' * terminalWidth)
+
+
+def printLess(lines):
+    if not sys.stdout.isatty():
+        for line in lines:
+            print(line)
+        return
+
+    (forPrint, forLess) = tee(lines, 2)
+    doLess = False
+    for i, line in enumerate(forPrint):
+        print(line)
+        if i >= _terminalHeight - 2:
+            doLess = True
+            break
+
+    if doLess:
+        less = proc.Popen(['less', '-'], stdin=proc.PIPE)
+        try:
+            for line in forLess:
+                if less.poll() is not None:
+                    break
+                less.stdin.write(bytes(line + '\n', 'utf-8'))
+        finally:
+            less.communicate()
