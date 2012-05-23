@@ -2,6 +2,8 @@
 from core import *
 import re
 
+_allFilesUpToDate = 'All files up to date.'
+
 
 class fetch(Command):
     """Fetch changes from TFS to Git without merging."""
@@ -9,6 +11,7 @@ class fetch(Command):
     def _initArgParser(self, parser):
         parser.addVerbose()
         parser.addNoChecks()
+        parser.addForce('make an empty commit when tf responds "%s". Use with caution!' % _allFilesUpToDate)
         parser.addDryRun()
         parser.addNumber('maximum number of changesets to fetch')
 
@@ -18,88 +21,78 @@ class fetch(Command):
         self.switchToTfsBranch()
 
     def _run(self):
-        args = self.args
-        domain = tf.getDomain()
+        tf.getDomain()
 
         print('Fetching from TFS')
-        lastCommit = git('log -1 --format=%H tfs')
 
         try:
-            lastChangeset = re.findall(r'^\d+', git('notes show'), re.M)[-1]
+            lastChangeset = git.getChangesetNumber()
+            if not lastChangeset:
+                raise Exception()
             print('Last synchronized changeset:', lastChangeset)
         except:
             lastChangeset = None
-            fail('Last changeset could not determined. Probably the last commit is missing a tf note. Commit: %s' % lastCommit)
+            fail('The last synchronized changeset could not determined. Probably the last commit is missing a tf note. Commit: %s' %
+                 git('log -1 --format=%H tfs'))
 
-        latestCommit = tf.history('-stopAfter:1')[0].id
-        print('Latest changeset on TFS:', latestCommit)
-        if lastChangeset == latestCommit:
+        latestChangeset = tf.history(stopAfter=1)[0].id
+        if self.args.verbose:
+            print('Latest changeset on TFS:', latestChangeset)
+        if lastChangeset == latestChangeset:
             print('Nothing to fetch')
             return False
 
-        print('Requesting tf history %s..%s' % (lastChangeset, latestCommit))
-        history = tf.history('-version:C%s~C%s' % (lastChangeset, latestCommit))
+        print('Requesting tf history %s..%s' % (lastChangeset, latestChangeset))
+        history = tf.history(version=(lastChangeset, latestChangeset))
         history.reverse()
         history.pop(0)
-        history = history[:args.number]
+        history = history[:self.args.number]
 
+        self.doFetch(history)
+
+    def doFetch(self, history):
         print('%d changeset(s) to fetch' % len(history))
+        domain = tf.getDomain()
+        dryRun = self.args.dryRun
+        verbose = self.args.verbose
 
-        def gitHasChanges():
-            return git('status -s')
-
-        def fetch(version, output=True):
-            return tf('get -version:%s -recursive .' % version, output=output, dryRun=args.dryRun)
-
-        def repair(lastCommit, lastChangeset, changesetToFetch):
-            print('But it may mean we have a problem, so let\'s check it.')
-            print('Trying to fetch the previous changeset and repeat...')
-            fetch(lastChangeset, output=False)
-
-            if gitHasChanges():
-                print('git-tf state is corrupted: the commit %s was expected to match changeset %s.' %
-                      (lastCommit, lastChangeset))
-                print('You can try to "git reset" to a non-corrupted commit and fetch/pull again.')
-                unpushed = git('log tfs..master --oneline')
-                if unpushed:
-                    print('You have unpushed commits:')
-                    printIndented(unpushed)
-                    print('Cherry-pick them when you finish repairing.')
-                fail()
-
-            print('No, there is no problem. Now fetching %s again...' % changesetToFetch)
-            fetch(changesetToFetch, output=False)
-
-        lastSyncedChangeset = lastChangeset
-        with ReadOnlyWorktree(args.verbose):
+        with ReadOnlyWorktree(verbose):
             try:
                 for i, cs in enumerate(history):
-                    printLine()
+                    if verbose:
+                        printLine()
                     print('Fetching [%d/%d] "%s"...' % (i + 1, len(history), cs.line))
-                    fetch(cs.id)
-                    if not gitHasChanges():
-                        print('From the Git\'s point of view, there is nothing new to commit in the changeset %s.' % \
-                              cs.id)
-                        print('Sometimes it happens with TFS branching.')
-                        if not i:
-                            repair(lastCommit, lastChangeset, cs.id)
-                        print('An empty commit will be made.')
-                    print('Committing to Git...')
+                    tfgetResponse = tf.get(cs.id, dryRun=dryRun, output=verbose).strip()
+                    if tfgetResponse == _allFilesUpToDate and not self.args.force:
+                        print()
+                        print('tf did not fetch anything. Usually it happens when the local folder contents is '
+                              'different from what TFS expects.')
+                        print('Try to repair tf state by retrieving an old changeset and then returning to this one')
+                        print('Or use --force option if you are absolutely sure that the changeset didn\'t actually '
+                              'change any files.')
+                        fail()
+
+                    if verbose:
+                        print('Committing to Git...')
                     comment = cs.comment
                     if not comment:
-                        print('The comment is empty. Using changeset number as a comment')
+                        if verbose:
+                            print('The comment is empty. Using changeset number as a comment')
                         comment = str(cs.id)
                     comment = comment.replace('"', '\\"')
-                    git('add -A .', dryRun=args.dryRun)
+                    git('add -A .', dryRun=dryRun)
                     commitArgs = r'commit --allow-empty -m "%s" --author="%s <%s@%s>" --date="%s"' % \
                                  (comment, cs.committer, cs.committer, domain, cs.dateIso)
-                    git(commitArgs, output=True, dryRun=args.dryRun)
-                    git('notes add -m %s' % cs.id, dryRun=args.dryRun)
-                    lastSyncedChangeset = cs.id
+                    git(commitArgs, output=verbose, dryRun=dryRun)
+                    git('notes add -m %s' % cs.id, dryRun=dryRun)
+                    if not verbose:
+                        print('Commit:', git('log -1 --format=%h'))
             except:
-                if not args.dryRun:
-                    print('Rolling back to the last synchronized changeset: %s' % lastSyncedChangeset)
-                    fetch(lastSyncedChangeset)
+                if not dryRun:
+                    lastSyncedChangeset = git.getChangesetNumber()
+                    if lastSyncedChangeset:
+                        print('Rolling back to the last synchronized changeset: %s' % lastSyncedChangeset)
+                        tf.get(lastSyncedChangeset, output=True)
                     git('reset --hard')
                     git('clean -fd')
                 raise

@@ -2,6 +2,7 @@ import subprocess as proc
 import os
 import stat
 import datetime
+import re
 import argparse
 import time
 import locale
@@ -26,8 +27,26 @@ _curCommand = None
 
 
 class Runner:
-    def __init__(self, prefix=''):
-        self.prefix = prefix
+    prefix = ''
+
+    def argsToStr(self, args):
+        if type(args) == str:
+            return args
+        elif type(args) in (tuple, list):
+            fmt, *args = args
+            fmt = self.argsToStr(fmt)
+            args = map(lambda a: a if type(a) == str else self.argsToStr(a), args)
+            return fmt.format(*args)
+        else:
+            return self.argsToStr(str(args))
+
+    def genCommand(self, args):
+        cmd = self.prefix
+        if args:
+            args = self.argsToStr(args).strip()
+            if args:
+                cmd += ' ' + args
+        return cmd
 
     def start(self, args):
         class Process:
@@ -52,7 +71,7 @@ class Runner:
                 return self.pipe.returncode
 
             def fail(self, lastMsg=None):
-                errorOutput = self.pipe.stderr.readall().decode('utf-8').strip()
+                errorOutput = self.pipe.stderr.read(-1).decode('utf-8').strip()
                 if errorOutput:
                     print(errorOutput)
                 print('Command "%s" exited with code %s' % (cmd, self.poll()))
@@ -60,12 +79,13 @@ class Runner:
                     print(lastMsg)
                 fail()
 
-        cmd = (self.prefix and self.prefix + ' ') + args
+        cmd = (self.prefix and self.prefix + ' ') + self.argsToStr(args)
         return Process(proc.Popen(cmd, shell=True, stderr=proc.PIPE, stdout=proc.PIPE))
 
     def __call__(self, args, allowedExitCodes=[0], errorValue=None, output=False, indent=1, dryRun=None, errorMsg=None):
         verbose = _curCommand and _curCommand.args.verbose > 1
 
+        args = self.argsToStr(args)
         if verbose:
             print('$ ' + (self.prefix and self.prefix + ' ') + args)
         if dryRun:
@@ -91,7 +111,18 @@ run = Runner()
 
 #######      GIT       #######
 
-git = Runner('git')
+
+class _git(Runner):
+    prefix = 'git'
+
+    def hasChanges(self):
+        return self('status -s')
+
+    def getChangesetNumber(self, commit=''):
+        note = git('notes show ' + commit, errorValue='')
+        return re.findall(r'^\d+', note, re.M)[-1] if note else None
+
+git = _git()
 try:
     git('--version', errorMsg='Git not found in the $PATH variable')
 except GitTfException:
@@ -101,21 +132,37 @@ except GitTfException:
 
 
 class _tf(Runner):
-    def __init__(self):
-        Runner.__init__(self, git('config tf.cmd', errorValue='tf'))
+    prefix = git('config tf.cmd', errorValue='tf')
+    paramPrefix = git('config tf.paramPrefix', errorValue='') or '/' if os.name == 'nt' else '-'
+
+    def argsToStr(self, args):
+        if type(args) == str and self.paramPrefix != '-':
+            args = args.replace('-', self.paramPrefix)
+        return Runner.argsToStr(self, args)
 
     class Changeset(object):
         def __init__(self, node):
             self.id = node.get('id')
+            if not self.id:
+                fail('Could not determine changeset id: %s' % node)
             self.comment = node.find('comment')
             self.comment = self.comment is not None and self.comment.text or ''
             self.dateIso = node.get('date')
             self.date = parseXmlDatetime(self.dateIso)
             self.committer = node.get('committer').split('\\', 1)[-1].strip()
-            self.line = ('%s %s %s %s' % (self.id, self.committer, self.date.ctime(), self.comment)).strip()
+            self.line = ' '.join((self.id, self.committer, self.date.ctime(), self.comment))\
+                .strip().replace('\n', ' ')[:128]
 
-    def history(self, args):
-        args = 'history -recursive -format:xml %s .' % args
+    def history(self, version=None, stopAfter=None):
+        filter = ['']
+        if version:
+            filter[0] += '-version:C{}~C{}'
+            filter += version
+        if stopAfter:
+            filter[0] += ' -stopafter:{}'
+            filter.append(stopAfter)
+
+        args = ('history -recursive -format:xml {} .', filter)
         history = etree.fromstring(self(args))
         return [self.Changeset(cs) for cs in history if cs.tag == 'changeset']
 
@@ -132,6 +179,10 @@ class _tf(Runner):
             return email[email.index('@') + 1:]
         except ValueError:
             fail('Could not determine the domain. Your email is: ')
+
+    def get(self, version, **kwargs):
+        return self(('get -version:{} -recursive .', version), **kwargs)
+
 
 tf = _tf()
 
@@ -177,11 +228,11 @@ class Command:
         os.chdir(root)
         self._free.append(lambda: os.chdir(origDir))
 
-    def checkStatus(self, checkTfs=None):
-        if git('status -s') != '':
+    def checkStatus(self, checkTfs=None, checkGit=True):
+        if checkGit and git('status -s') != '':
             fail('Worktree is dirty. Stash your changes before proceeding.')
 
-        if checkTfs is True or not self.args.noChecks:
+        if checkTfs is True and not self.args.noChecks:
             print('Checking TFS status. There must be no pending changes...')
             if tf('status') != 'There are no matching pending changes.':
                 fail('TFS status is dirty!')
@@ -258,6 +309,9 @@ class ArgParser(argparse.ArgumentParser):
 
     def addNumber(self, help):
         self.add_argument('--number', type=int, default=None, help=help)
+
+    def addForce(self, help):
+        self.add_argument('-f', '--force', action='store_true', help=help)
 
 
 def parseXmlDatetime(text):
