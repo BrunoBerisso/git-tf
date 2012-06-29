@@ -2,6 +2,7 @@
 from core import *
 import shutil
 import re
+import repair
 import wi
 
 
@@ -17,7 +18,7 @@ class push(Command):
     def __enter__(self):
         self.moveToRootDir()
         self.checkStatus()
-        self.switchToTfsBranch()
+        self.switchBranch()
 
     def _push(self, hash, index, total):
         dryRun = self.args.dryRun
@@ -103,10 +104,9 @@ class push(Command):
                 print('Changeset number:', changeSetNumber)
         except:
             if not dryRun:
-                print('Restoring Git and TFS state...')
-                with ReadOnlyWorktree():
-                    tf('undo -recursive .', allowedExitCodes=[0, 100])
-                git('checkout -f tfs')
+                repairer = repair()
+                repairer.checkoutBranch = 'tfs'
+                repairer._run()
             raise
 
         # add a note about the changeset number
@@ -135,7 +135,7 @@ class push(Command):
             return
 
         print('Checking whether there are no unfetched changes on TFS...')
-        ourLatestChangeset = git.getChangesetNumber(lastCommit)
+        ourLatestChangeset = git.getChangesetNumber(lastCommit, fail=True)
         theirLatestChangeset = tf.history(stopAfter=1)[0].id
         if int(ourLatestChangeset) < int(theirLatestChangeset):
             print('There are unfetched changes on TFS. Fetch and merge them before pushing')

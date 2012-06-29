@@ -118,9 +118,13 @@ class _git(Runner):
     def hasChanges(self):
         return self('status -s')
 
-    def getChangesetNumber(self, commit=''):
+    def getChangesetNumber(self, commit='', fail=False):
         note = git('notes show ' + commit, errorValue='')
-        return re.findall(r'^\d+', note, re.M)[-1] if note else None
+        return re.findall(r'^\d+', note, re.M)[-1] if note else self.failNoLastChangeset() if fail else None
+
+    def failNoLastChangeset(self):
+        fail('The last synchronized changeset could not determined. Probably the last commit is missing a tf note. Commit: %s' %
+                 git('log -1 --format=%H tfs'))
 
 git = _git()
 try:
@@ -183,6 +187,8 @@ class _tf(Runner):
     def get(self, version, **kwargs):
         return self(('get -version:{} -recursive .', version), **kwargs)
 
+    def hasPendingChanges(self):
+        return self('status') != 'There are no matching pending changes.'
 
 tf = _tf()
 
@@ -216,7 +222,7 @@ class Command:
             prog='git-tf-' + type(self).__name__)
 
     def initArgParser(self, parser):
-        parser.set_defaults(cmd=self, dryRun=False, verbose=0)
+        parser.set_defaults(cmd=self, dryRun=False, verbose=0, noChecks=False)
         self._initArgParser(parser)
 
     def _initArgParser(self, parser):
@@ -234,25 +240,26 @@ class Command:
 
         if checkTfs is True and not self.args.noChecks:
             print('Checking TFS status. There must be no pending changes...')
-            if tf('status') != 'There are no matching pending changes.':
+            if tf.hasPendingChanges():
                 fail('TFS status is dirty!')
 
-    def switchToTfsBranch(self):
+    def switchBranch(self, branch='tfs', allowNoBranch=False):
         def getCurBranch():
             branches = git('branch').splitlines()
-            return [b[2:] for b in branches if b.startswith('* ')][0]
-
-        noBranch = '(no branch)'
+            branch = [b[2:] for b in branches if b.startswith('* ')][0]
+            return branch if branch != '(no branch)' else None
 
         def checkoutBranch(branch):
             curBranch = getCurBranch()
-            if curBranch != branch and curBranch != noBranch:
+            if curBranch != branch and curBranch:
                 git('checkout ' + branch)
         origBranch = getCurBranch()
-        if origBranch == noBranch:
+        if origBranch is None and not allowNoBranch:
             fail('Not currently on any branch')
-        checkoutBranch('tfs')
-        self._free.append(lambda: checkoutBranch(origBranch))
+        if origBranch != branch:
+            checkoutBranch(branch)
+            if origBranch:
+                self._free.append(lambda: checkoutBranch(origBranch))
 
     def __enter__(self):
         pass
